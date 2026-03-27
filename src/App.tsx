@@ -106,10 +106,10 @@ export default function App() {
   const [poissonPlusMinus, setPoissonPlusMinus] = useState(0)
   const [totalEvents, setTotalEvents] = useState(0)
   const [badPixelCount, setBadPixelCount] = useState(0)
-  const [useLongExposure, setUseLongExposure] = useState(true)
-  const [useZScore, setUseZScore] = useState(true)
-  const [cameraAutoSettings, setCameraAutoSettings] = useState(false)
-  const [aiEnabled, setAiEnabled] = useState(true)
+  const useLongExposure = true
+  const useZScore = true
+  const cameraAutoSettings = false
+  const aiEnabled = true
   const [latestAiLabel, setLatestAiLabel] = useState<AiEventClass>('noise')
   const [latestAiConfidence, setLatestAiConfidence] = useState(0)
   const [overheatingScore, setOverheatingScore] = useState(0)
@@ -1062,59 +1062,43 @@ export default function App() {
         <section className="metrics-panel panel-card">
           <div className="metric-tile">
             <span>EPM</span>
-            <strong>{epm}</strong>
+            <strong>{status === 'idle' ? 0 : epm}</strong>
           </div>
           <div className="metric-tile">
             <span>EPM (CMOS)</span>
-            <strong>{cameraEpm.toFixed(1)}</strong>
+            <strong>{status === 'idle' ? '0.0' : cameraEpm.toFixed(1)}</strong>
           </div>
           <div className="metric-tile">
             <span>EPM (ALS)</span>
-            <strong>{ambientEpm.toFixed(1)}</strong>
+            <strong>{status === 'idle' ? '0.0' : ambientEpm.toFixed(1)}</strong>
           </div>
           <div className="metric-tile">
             <span>мкР/год live</span>
-            <strong>{liveDoseRate.toFixed(2)}</strong>
+            <strong>{status === 'idle' ? '0.00' : liveDoseRate.toFixed(2)}</strong>
           </div>
           <div className="metric-tile">
             <span>EPM за 5 хв</span>
-            <strong>{fiveMinuteEpm.toFixed(1)}</strong>
+            <strong>{status === 'idle' ? '0.0' : fiveMinuteEpm.toFixed(1)}</strong>
           </div>
           <div className="metric-tile">
             <span>95% Poisson CI</span>
-            <strong>{epm.toFixed(1)} ± {poissonPlusMinus.toFixed(1)}</strong>
+            <strong>{status === 'idle' ? '0.0 ± 0.0' : `${epm.toFixed(1)} ± ${poissonPlusMinus.toFixed(1)}`}</strong>
           </div>
           <div className="metric-tile">
             <span>Total events</span>
-            <strong>{totalEvents}</strong>
+            <strong>{status === 'idle' ? 0 : totalEvents}</strong>
           </div>
           <div className="metric-tile">
             <span>Накопичена доза</span>
-            <strong>{accumulatedDose.toFixed(3)}</strong>
+            <strong>{status === 'idle' ? '0.000' : accumulatedDose.toFixed(3)}</strong>
           </div>
           <div className="metric-tile">
             <span>Подій у логу</span>
-            <strong>{eventLog.length}</strong>
+            <strong>{status === 'idle' ? 0 : eventLog.length}</strong>
           </div>
           <div className="metric-tile">
-            <span>AI клас</span>
-            <strong>{latestAiConfidence > 0 ? latestAiLabel : 'searching...'}</strong>
-          </div>
-          <div className="metric-tile">
-            <span>AI впевненість</span>
-            <strong>{(latestAiConfidence * 100).toFixed(1)}%</strong>
-          </div>
-          <div className="metric-tile">
-            <span>Overheat score</span>
-            <strong>{(overheatingScore * 100).toFixed(0)}%</strong>
-          </div>
-          <div className="metric-tile">
-            <span>Прогноз дози</span>
-            <strong>{predictedDoseRate.toFixed(1)}</strong>
-          </div>
-          <div className="metric-tile">
-            <span>Frame time / Dead-time</span>
-            <strong>{meanFrameTimeMs.toFixed(1)}ms × {deadTimeCorrection.toFixed(2)}</strong>
+            <span>Frame time</span>
+            <strong>{status === 'idle' ? '0ms' : `${meanFrameTimeMs.toFixed(1)}ms`}</strong>
           </div>
         </section>
 
@@ -1169,22 +1153,6 @@ export default function App() {
             <label className="toggle-row">
               <span>Alarm</span>
               <input type="checkbox" checked={isAlarmEnabled} onChange={(event) => setIsAlarmEnabled(event.target.checked)} />
-            </label>
-            <label className="toggle-row">
-              <span>AI класифікатор</span>
-              <input type="checkbox" checked={aiEnabled} onChange={(event) => setAiEnabled(event.target.checked)} />
-            </label>
-            <label className="toggle-row">
-              <span>Long Exposure (накопич.)</span>
-              <input type="checkbox" checked={useLongExposure} onChange={(event) => setUseLongExposure(event.target.checked)} />
-            </label>
-            <label className="toggle-row">
-              <span>Z-Score (сусіди)</span>
-              <input type="checkbox" checked={useZScore} onChange={(event) => setUseZScore(event.target.checked)} />
-            </label>
-            <label className="toggle-row">
-              <span>Авто-налаштування камери</span>
-              <input type="checkbox" checked={cameraAutoSettings} onChange={(event) => setCameraAutoSettings(event.target.checked)} />
             </label>
             <button className="ghost" onClick={saveToCloud}>Зберегти в хмару</button>
             <div className="meta-label">{cloudStatus}</div>
