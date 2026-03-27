@@ -150,6 +150,8 @@ export default function App() {
   const [predictedDoseRate, setPredictedDoseRate] = useState(0)
   const [energyBins, setEnergyBins] = useState<number[]>(new Array(16).fill(0))
   const [cloudStatus, setCloudStatus] = useState('Cloud: idle')
+  const [geminiApiKey, setGeminiApiKey] = useState(() => localStorage.getItem('rad-gemini-key') ?? '')
+  const [isAiThinking, setIsAiThinking] = useState(false)
   const [terminalInput, setTerminalInput] = useState('')
   const [terminalImageName, setTerminalImageName] = useState('')
   const [terminalImageAnalysis, setTerminalImageAnalysis] = useState<PhotoRadiationAnalysis | null>(null)
@@ -966,6 +968,41 @@ export default function App() {
     pushTerminalMessage(userMessage)
     setTerminalInput('')
 
+    // --- Gemini API (real AI, handles absolutely anything) ---
+    if (geminiApiKey.trim()) {
+      setIsAiThinking(true)
+      const systemPrompt = `Ти вбудований AI асистент у вебдодатку для радіаційного моніторингу. Відповідай на будь-які питання (радіація, фізика, хімія, код, загальні теми). Також можеш керувати інтерфейсом сайту.
+
+Поточний стан: EPM=${epm.toFixed(1)}, доза=${liveDoseRate.toFixed(2)} мкР/год, режим=${detectionMode}
+Стан секцій: камера=${siteConfig.showCamera}, метрики=${siteConfig.showMetrics}, графік=${siteConfig.showGraph}, налаштування=${siteConfig.showSettings}, лог=${siteConfig.showEventLog}
+
+Якщо користувач хоче змінити UI (сховати/показати секцію, змінити заголовок тощо) — додай в кінці відповіді блок:
+<site-action>{"showMetrics":true,"showGraph":false}</site-action>
+Включай у JSON лише поля які треба змінити. Відповідай мовою користувача.`
+
+      fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey.trim()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: prompt }] }]
+        })
+      })
+        .then(r => r.json())
+        .then(data => {
+          const raw: string = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? 'Немає відповіді від Gemini.'
+          const actionMatch = raw.match(/<site-action>(.*?)<\/site-action>/s)
+          const displayText = raw.replace(/<site-action>.*?<\/site-action>/s, '').trim()
+          if (actionMatch) {
+            try { updateSiteConfig(JSON.parse(actionMatch[1])) } catch {}
+          }
+          pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: displayText || '(порожня відповідь)' })
+        })
+        .catch(() => pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: 'Помилка Gemini API. Перевір ключ або інтернет-з\'єднання.' }))
+        .finally(() => setIsAiThinking(false))
+      return
+    }
+
     // --- AI site-editor commands ---
     const hide = /прибер|убер|сховай|видал|hide|remove|вимк|закр/i.test(prompt)
     const show = /покажи|додай|відкрий|включи|show|add|відображ/i.test(prompt)
@@ -1293,9 +1330,10 @@ export default function App() {
             <input
               value={terminalInput}
               onChange={(event) => setTerminalInput(event.target.value)}
-              placeholder="Наприклад: як зменшити шум CMOS?"
+              placeholder={geminiApiKey ? 'Запитай що завгодно...' : 'Наприклад: сховай лог, покажи метрики...'}
+              disabled={isAiThinking}
             />
-            <button type="submit">Send</button>
+            <button type="submit" disabled={isAiThinking}>{isAiThinking ? '...' : 'Send'}</button>
           </form>
           <div className="terminal-tools">
             <label className="ghost terminal-upload">
@@ -1305,6 +1343,16 @@ export default function App() {
             <span className="meta-label">
               {isAnalyzingImage ? 'Аналіз фото...' : terminalImageName ? `Фото: ${terminalImageName}` : 'Фото не вибрано'}
             </span>
+          </div>
+          <div className="terminal-key-row">
+            <input
+              className="terminal-key-input"
+              type="password"
+              placeholder="Gemini API key (необов'язково)"
+              value={geminiApiKey}
+              onChange={e => { setGeminiApiKey(e.target.value); localStorage.setItem('rad-gemini-key', e.target.value) }}
+            />
+            <span className="meta-label">{geminiApiKey ? '🟢 Gemini увімкнено' : '⚪ Локальний AI'}</span>
           </div>
         </section>
 

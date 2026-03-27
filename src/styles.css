@@ -360,6 +360,30 @@ input[type='range'] {
   flex-wrap: wrap;
 }
 
+.terminal-key-row {
+  margin-top: 0.5rem;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.terminal-key-input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 6px;
+  color: inherit;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.75rem;
+  outline: none;
+}
+
+.terminal-key-input:focus {
+  border-color: rgba(146,255,175,0.5);
+}
+
 .terminal-upload {
   position: relative;
   overflow: hidden;
