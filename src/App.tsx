@@ -65,6 +65,40 @@ const alarmThresholdDefault = 50
 const aiConfidenceThreshold = 0.6
 const terminalMessageLimit = 28
 
+type SiteConfig = {
+  showMetrics: boolean
+  showGraph: boolean
+  showSettings: boolean
+  showEventLog: boolean
+  showAiTerminal: boolean
+  showCamera: boolean
+  heroTitle: string
+  heroDesc: string
+}
+
+const defaultSiteConfig: SiteConfig = {
+  showMetrics: true,
+  showGraph: true,
+  showSettings: true,
+  showEventLog: true,
+  showAiTerminal: true,
+  showCamera: true,
+  heroTitle: 'Темний сенсор. Короткі спалахи. Живий лічильник.',
+  heroDesc: 'Вебдодаток читає затемнений потік камери, шукає короткі яскраві кластери і веде live-оцінку подій, фону та накопиченої дози.'
+}
+
+function loadSiteConfig(): SiteConfig {
+  try {
+    const saved = localStorage.getItem('rad-site-config')
+    if (saved) return { ...defaultSiteConfig, ...JSON.parse(saved) }
+  } catch {}
+  return { ...defaultSiteConfig }
+}
+
+function saveSiteConfig(config: SiteConfig) {
+  localStorage.setItem('rad-site-config', JSON.stringify(config))
+}
+
 export default function App() {
   const aiInitializedRef = useRef(false)
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -146,6 +180,15 @@ export default function App() {
   const secondBucketRef = useRef<{ startedAt: number; count: number }>({ startedAt: 0, count: 0 })
   const zeroNoiseAdjustRef = useRef<{ startedAt: number; adjustedAt: number }>({ startedAt: 0, adjustedAt: 0 })
   const measurementStartedAtRef = useRef<number | null>(null)
+  const [siteConfig, setSiteConfigState] = useState<SiteConfig>(loadSiteConfig)
+
+  const updateSiteConfig = (patch: Partial<SiteConfig>) => {
+    setSiteConfigState(prev => {
+      const next = { ...prev, ...patch }
+      saveSiteConfig(next)
+      return next
+    })
+  }
 
   useEffect(() => {
     if (!aiInitializedRef.current) {
@@ -923,6 +966,84 @@ export default function App() {
     pushTerminalMessage(userMessage)
     setTerminalInput('')
 
+    // --- AI site-editor commands ---
+    const hide = /прибер|убер|сховай|видал|hide|remove|вимк|закр/i.test(prompt)
+    const show = /покажи|додай|відкрий|включи|show|add|відображ/i.test(prompt)
+    const reset = /скид|скинь|відновити|відновит|reset|default|все повернути/i.test(prompt)
+
+    if (reset && /налаштув|конфіг|сайт|все/i.test(prompt)) {
+      updateSiteConfig(defaultSiteConfig)
+      pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: '✅ Сайт повернуто до початкового вигляду. Оновіть сторінку щоб побачити зміни.' })
+      return
+    }
+
+    if (hide || show) {
+      const val = show
+
+      if (/метрик|metric|показник/i.test(prompt)) {
+        updateSiteConfig({ showMetrics: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Метрики ${val ? 'показано' : 'приховано'}. Оновіть сторінку.` })
+        return
+      }
+      if (/граф|graph|тренд|trend/i.test(prompt)) {
+        updateSiteConfig({ showGraph: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Графіки ${val ? 'показано' : 'приховано'}. Оновіть сторінку.` })
+        return
+      }
+      if (/налаштув|setting|пороги|slider/i.test(prompt)) {
+        updateSiteConfig({ showSettings: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Налаштування ${val ? 'показано' : 'приховано'}. Оновіть сторінку.` })
+        return
+      }
+      if (/лог|log|поді|event/i.test(prompt)) {
+        updateSiteConfig({ showEventLog: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Лог подій ${val ? 'показано' : 'приховано'}. Оновіть сторінку.` })
+        return
+      }
+      if (/термінал|terminal|чат|ai|айшку/i.test(prompt)) {
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `⚠️ Не можу сховати сам себе 😄 Але можу сховати інші секції.` })
+        return
+      }
+      if (/камер|camera|сенсор|sensor/i.test(prompt)) {
+        updateSiteConfig({ showCamera: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Секція камери ${val ? 'показана' : 'прихована'}. Оновіть сторінку.` })
+        return
+      }
+      if (/все|all|всі секці/i.test(prompt)) {
+        updateSiteConfig({ showMetrics: val, showGraph: val, showSettings: val, showEventLog: val, showCamera: val })
+        pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Всі секції ${val ? 'показано' : 'приховано'} (крім AI терміналу). Оновіть сторінку.` })
+        return
+      }
+    }
+
+    // --- Change title/description ---
+    const titleMatch = prompt.match(/(?:заголовок|title|назву?)\s+(?:на|:)?\s*[«"]?(.+?)[»"]?$/i)
+    if (titleMatch?.[1]) {
+      updateSiteConfig({ heroTitle: titleMatch[1].trim() })
+      pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Заголовок змінено на «${titleMatch[1].trim()}». Оновіть сторінку.` })
+      return
+    }
+    const descMatch = prompt.match(/(?:опис|description|підзаголовок)\s+(?:на|:)?\s*[«"]?(.+?)[»"]?$/i)
+    if (descMatch?.[1]) {
+      updateSiteConfig({ heroDesc: descMatch[1].trim() })
+      pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `✅ Опис змінено. Оновіть сторінку.` })
+      return
+    }
+
+    // --- Show current config ---
+    if (/що показ|які секці|конфіг|config|що сховано/i.test(prompt)) {
+      const sc = siteConfig
+      const lines = [
+        `Камера: ${sc.showCamera ? '✅' : '❌'}`,
+        `Метрики: ${sc.showMetrics ? '✅' : '❌'}`,
+        `Графіки: ${sc.showGraph ? '✅' : '❌'}`,
+        `Налаштування: ${sc.showSettings ? '✅' : '❌'}`,
+        `Лог подій: ${sc.showEventLog ? '✅' : '❌'}`,
+      ].join(' | ')
+      pushTerminalMessage({ id: `${Date.now()}-ai`, role: 'ai', text: `Поточний стан секцій: ${lines}` })
+      return
+    }
+
     if (/фото|зображ|image|jpg|png|визнач|радіац.*фото|фото.*радіац/i.test(prompt)) {
       if (!terminalImageAnalysis) {
         pushTerminalMessage({
@@ -1004,17 +1125,14 @@ export default function App() {
       <header className="hero-panel">
         <div>
           <p className="eyebrow">Radiation Detection Web</p>
-          <h1>Темний сенсор. Короткі спалахи. Живий лічильник.</h1>
-          <p className="hero-copy">
-            Вебдодаток читає затемнений потік камери, шукає короткі яскраві кластери і веде live-оцінку подій,
-            фону та накопиченої дози.
-          </p>
+          <h1>{siteConfig.heroTitle}</h1>
+          <p className="hero-copy">{siteConfig.heroDesc}</p>
         </div>
         <div className={`status-pill ${statusTone}`}>{statusDetail}</div>
       </header>
 
       <main className="dashboard-grid">
-        <section className="camera-panel panel-card">
+        {siteConfig.showCamera && (<section className="camera-panel panel-card">
           <div className="panel-heading">
             <h2>Сенсор</h2>
             <label className="mode-select">
@@ -1057,9 +1175,9 @@ export default function App() {
               <strong>{badPixelCount}</strong>
             </div>
           </div>
-        </section>
+        </section>)}
 
-        <section className="metrics-panel panel-card">
+        {siteConfig.showMetrics && (<section className="metrics-panel panel-card">
           <div className="metric-tile">
             <span>EPM</span>
             <strong>{status === 'idle' ? 0 : epm}</strong>
@@ -1100,9 +1218,9 @@ export default function App() {
             <span>Frame time</span>
             <strong>{status === 'idle' ? '0ms' : `${meanFrameTimeMs.toFixed(1)}ms`}</strong>
           </div>
-        </section>
+        </section>)}
 
-        <section className="graph-panel panel-card">
+        {siteConfig.showGraph && (<section className="graph-panel panel-card">
           <div className="panel-heading">
             <h2>Фон за останні 5 хвилин</h2>
             <div className="button-row">
@@ -1133,9 +1251,9 @@ export default function App() {
           </div>
           <h3>Режим спектрометра</h3>
           <EnergyHistogram bins={energyBins} />
-        </section>
+        </section>)}
 
-        <section className="settings-panel panel-card">
+        {siteConfig.showSettings && (<section className="settings-panel panel-card">
           <div className="panel-heading">
             <h2>Пороги і перерахунок</h2>
             <button className="ghost" onClick={exportReport}>Експорт</button>
@@ -1157,7 +1275,7 @@ export default function App() {
             <button className="ghost" onClick={saveToCloud}>Зберегти в хмару</button>
             <div className="meta-label">{cloudStatus}</div>
           </div>
-        </section>
+        </section>)}
 
         <section className="ai-mini-panel panel-card">
           <div className="panel-heading">
@@ -1190,7 +1308,7 @@ export default function App() {
           </div>
         </section>
 
-        <section className="log-panel panel-card">
+        {siteConfig.showEventLog && (<section className="log-panel panel-card">
           <div className="panel-heading">
             <h2>Лог подій</h2>
             <span>{eventLog.length} записів</span>
@@ -1210,7 +1328,7 @@ export default function App() {
               </article>
             ))}
           </div>
-        </section>
+        </section>)}
       </main>
     </div>
   )
@@ -1398,7 +1516,7 @@ function buildAiReply(
   }
 
   if (/що ти|who are|what are you|хто ти/i.test(p)) {
-    return 'Я — вбудований Mini AI цього вебдодатку для радіаційного моніторингу. Працюю без інтернету, локально. Знаю радіаційну фізику, можу аналізувати фото і відповідати на загальні питання.'
+    return 'Я — вбудований Mini AI цього вебдодатку. Можу відповідати про радіацію, фізику, код, а також керувати сайтом: ховати/показувати секції, змінювати заголовок. Наприклад: «сховай лог», «покажи метрики», «заголовок на Мій детектор», «що показано».'
   }
 
   // --- Photo follow-up without keyword фото ---
