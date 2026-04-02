@@ -6,6 +6,7 @@ import {
   resetDetectorState,
   getBadPixelCount,
   arrhenius,
+  updateCalibrationMapsEMA,
   type CalibrationMaps,
   type RadiationEvent,
 } from './lib/detector'
@@ -22,6 +23,11 @@ const CALIB_FRAMES = 40          // frames to collect for DCNU/PRNU maps
 const DOWNSCALE    = 0.25        // frame downscale for perf (still sufficient for detection)
 const MAX_LOG      = 80          // max events in live log
 const GRAPH_LEN    = 60          // seconds of history in graph
+const ZSCORE_WINDOW = 60         // rolling seconds for outlier baseline
+const ZSCORE_LIMIT = 4.0         // outlier trigger threshold
+const ROLLING_DARK_MS = 5 * 60 * 1000
+const ROLLING_DARK_ALPHA = 0.06
+const DOSE_MEDIAN_WINDOW = 9
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type AppStatus = 'idle' | 'calibrating' | 'measuring' | 'error'
@@ -43,6 +49,21 @@ const DEFAULT_SETTINGS: Settings = {
 function fmt1(n: number) { return n.toFixed(1) }
 function fmt2(n: number) { return n.toFixed(2) }
 function fmtPct(n: number) { return Math.round(n) + ' %' }
+
+function meanStd(values: number[]): { mean: number; std: number } {
+  if (values.length === 0) return { mean: 0, std: 0 }
+  const mean = values.reduce((s, v) => s + v, 0) / values.length
+  const variance = values.reduce((s, v) => s + (v - mean) * (v - mean), 0) / values.length
+  return { mean, std: Math.sqrt(Math.max(variance, 0)) }
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const m = Math.floor(sorted.length / 2)
+  if (sorted.length % 2 === 0) return 0.5 * (sorted[m - 1] + sorted[m])
+  return sorted[m]
+}
 
 function describeCameraError(err: unknown): string {
   if (!(err instanceof Error)) {
@@ -125,6 +146,11 @@ export default function App() {
   // Timing / accumulation
   const lastTickRef    = useRef<number>(0)
   const eventBufRef    = useRef<RadiationEvent[]>([])  // events since last tick
+  const rollingNextDarkRef = useRef<number>(0)
+  const zscoreWindowRef = useRef<number[]>([])
+  const doseWindowRef = useRef<number[]>([])
+  const ewmaRef = useRef<number | null>(null)
+  const kalmanRef = useRef<{ x: number; p: number; ready: boolean }>({ x: 0, p: 8, ready: false })
 
   // Temperature (Battery API or manual estimate)
   const tempRef        = useRef<number>(25)
@@ -149,6 +175,12 @@ export default function App() {
   const startedAtRef   = useRef<number>(0)
   const [threshold,    setThreshold]    = useState(0)
   const [frameSigma,   setFrameSigma]   = useState(0)
+  const [rawCpm,       setRawCpm]       = useState(0)
+  const [ewmaCpm,      setEwmaCpm]      = useState(0)
+  const [kalmanCpm,    setKalmanCpm]    = useState(0)
+  const [ewmaAlpha,    setEwmaAlpha]    = useState(0)
+  const [lastZscore,   setLastZscore]   = useState(0)
+  const [outliersCut,  setOutliersCut]  = useState(0)
 
   // ─── Battery temperature ───────────────────────────────────────────────────
   useEffect(() => {
@@ -214,15 +246,61 @@ export default function App() {
       lastTickRef.current = now
 
       const newEvents = eventBufRef.current.splice(0)
-      addObservation(newEvents.length, dt)
+      const cpsRaw = newEvents.length / Math.max(dt, 0.25)
+      const baseline = zscoreWindowRef.current.slice(-ZSCORE_WINDOW)
+      const { mean, std } = meanStd(baseline)
+      let z = 0
+      let eventsForBayes = newEvents.length
+
+      if (baseline.length >= 12 && std > 0.02) {
+        z = (cpsRaw - mean) / std
+        if (Math.abs(z) > ZSCORE_LIMIT) {
+          const clippedCps = Math.max(0, mean + Math.sign(z) * 3 * std)
+          eventsForBayes = Math.max(0, Math.round(clippedCps * dt))
+          setOutliersCut(prev => prev + 1)
+        }
+      }
+
+      zscoreWindowRef.current = [...baseline, cpsRaw].slice(-ZSCORE_WINDOW)
+      setLastZscore(z)
+      addObservation(eventsForBayes, dt)
 
       const est = estimateCPM(settings.efficiencyCoeff)
-      const dose = cpmToDose(est.cpm, settings.naturalBgMsvH, settings.sensorFactor)
+      setRawCpm(est.cpm)
+
+      const prevEwma = ewmaRef.current
+      const innovation = prevEwma === null ? 0 : Math.abs(est.cpm - prevEwma)
+      const alpha = Math.max(0.12, Math.min(0.82, 0.18 + (innovation / Math.max(10, est.cpm + 1)) * 0.6))
+      const ewma = prevEwma === null ? est.cpm : alpha * est.cpm + (1 - alpha) * prevEwma
+      ewmaRef.current = ewma
+      setEwmaAlpha(alpha)
+      setEwmaCpm(ewma)
+
+      const kState = kalmanRef.current
+      if (!kState.ready) {
+        kState.x = ewma
+        kState.p = 12
+        kState.ready = true
+      }
+      const q = 1.5 + Math.min(10, innovation * 0.15)
+      const r = Math.max(4, std * std * 3600)
+      kState.p += q
+      const gain = kState.p / (kState.p + r)
+      kState.x = kState.x + gain * (ewma - kState.x)
+      kState.p = (1 - gain) * kState.p
+      const kCpm = Math.max(0, kState.x)
+      setKalmanCpm(kCpm)
+
+      const doseRaw = cpmToDose(kCpm, settings.naturalBgMsvH, settings.sensorFactor)
+      const nextDoseWindow = [...doseWindowRef.current, doseRaw].slice(-DOSE_MEDIAN_WINDOW)
+      doseWindowRef.current = nextDoseWindow
+      const dose = median(nextDoseWindow)
+
       setBayes(est)
       setDoseRate(dose)
       setAccumDose(prev => prev + (dose / 3600) * dt)
       setElapsedSec(Math.round((now - startedAtRef.current) / 1000))
-      setGraphPoints(prev => [...prev.slice(-(GRAPH_LEN - 1)), est.cpm])
+      setGraphPoints(prev => [...prev.slice(-(GRAPH_LEN - 1)), kCpm])
 
       if (newEvents.length > 0) {
         const tagged = newEvents.map(e => ({ ...e, doseRate: dose }))
@@ -279,6 +357,19 @@ export default function App() {
     }
 
     // ── Detection phase ──
+    if (calibMapRef.current && Date.now() >= rollingNextDarkRef.current) {
+      const gray = new Float32Array(sw * sh)
+      for (let i = 0; i < sw * sh; i++) {
+        gray[i] = 0.299 * imageData.data[i*4]
+                + 0.587 * imageData.data[i*4+1]
+                + 0.114 * imageData.data[i*4+2]
+      }
+      updateCalibrationMapsEMA(calibMapRef.current, gray, ROLLING_DARK_ALPHA)
+      setBadPixels(getBadPixelCount())
+      rollingNextDarkRef.current = Date.now() + ROLLING_DARK_MS
+      setStatusMsg('Rolling dark frame оновлено через EMA. Вимірювання триває.')
+    }
+
     const result = detectFrame(imageData.data, sw, sh, calibMapRef.current, tempRef.current)
     setThreshold(result.threshold)
     setFrameSigma(result.sigma)
@@ -349,6 +440,16 @@ export default function App() {
     setAccumDose(0)
     setCalibProgress(0)
     setElapsedSec(0)
+    setRawCpm(0)
+    setEwmaCpm(0)
+    setKalmanCpm(0)
+    setEwmaAlpha(0)
+    setLastZscore(0)
+    setOutliersCut(0)
+    zscoreWindowRef.current = []
+    doseWindowRef.current = []
+    ewmaRef.current = null
+    kalmanRef.current = { x: 0, p: 8, ready: false }
 
     const hasPermission = cameraPerm === 'granted' || await requestCameraPermission()
     if (!hasPermission) return
@@ -379,6 +480,7 @@ export default function App() {
       } catch { /* constraints not supported on this device */ }
 
       await video.play()
+      rollingNextDarkRef.current = Date.now() + ROLLING_DARK_MS
     } catch (err) {
       setStatus('error')
       setStatusMsg(describeCameraError(err))
@@ -458,7 +560,6 @@ export default function App() {
     <div className="app-shell">
 
       {/* Hidden elements */}
-      <video ref={videoRef} muted playsInline style={{ display: 'none' }} />
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
       {/* Hero */}
@@ -515,6 +616,32 @@ export default function App() {
 
       {/* Main dashboard */}
       <div className="dashboard-grid">
+
+        <div className="panel-card camera-panel" style={{ gridColumn: 'span 12' }}>
+          <div className="panel-heading">
+            <h2>Потік камери (live)</h2>
+            <span style={{ color: 'var(--muted)', fontSize: '0.82rem' }}>
+              {videoRef.current?.videoWidth ? `${videoRef.current.videoWidth}×${videoRef.current.videoHeight}` : 'немає потоку'}
+            </span>
+          </div>
+          <div className="camera-stage">
+            <video ref={videoRef} className="camera-video" muted playsInline autoPlay />
+          </div>
+          <div className="camera-meta">
+            <label>
+              <span className="meta-label">Режим</span>
+              <strong>{status === 'measuring' ? 'Вимірювання' : status === 'calibrating' ? 'Калібрування' : 'Очікування'}</strong>
+            </label>
+            <label>
+              <span className="meta-label">Дозвіл камери</span>
+              <strong>{cameraPerm}</strong>
+            </label>
+            <label>
+              <span className="meta-label">Оновлення dark frame</span>
+              <strong>кожні 5 хв (EMA)</strong>
+            </label>
+          </div>
+        </div>
 
         {/* ─── Main metrics ─── */}
         <div className="panel-card metrics-panel" style={{ gridColumn: 'span 12' }}>
@@ -582,6 +709,22 @@ export default function App() {
             </small>
           </div>
 
+          <div className="metric-tile" style={{ gridColumn: 'span 2' }}>
+            <span>CPM фільтри</span>
+            <strong style={{ fontSize: '1.2rem' }}>Raw {fmt1(rawCpm)} · EWMA {fmt1(ewmaCpm)} · Kalman {fmt1(kalmanCpm)}</strong>
+            <small style={{ color: 'var(--muted)', fontSize: '0.78rem', display: 'block', marginTop: 2 }}>
+              EWMA α={fmt2(ewmaAlpha)} (адаптивно)
+            </small>
+          </div>
+
+          <div className="metric-tile">
+            <span>Z-Score outlier</span>
+            <strong style={{ color: Math.abs(lastZscore) > ZSCORE_LIMIT ? 'var(--warn)' : 'inherit' }}>{fmt2(lastZscore)}</strong>
+            <small style={{ color: 'var(--muted)', fontSize: '0.78rem', display: 'block', marginTop: 2 }}>
+              Відсічено сплесків: {outliersCut}
+            </small>
+          </div>
+
         </div>
 
         {/* ─── Bayesian CI progress note ─── */}
@@ -597,14 +740,14 @@ export default function App() {
         {/* ─── CPM Sparkline ─── */}
         <div className="panel-card graph-panel" style={{ gridColumn: 'span 12' }}>
           <div className="panel-heading">
-            <h2>CPM — остання хвилина</h2>
-            <span style={{ color: 'var(--muted)', fontSize: '0.82rem' }}>Байєс · 95 % CI: {fmt1(bayes.ci95Low)} – {fmt1(bayes.ci95High)}</span>
+            <h2>CPM (Kalman+EWMA) — остання хвилина</h2>
+            <span style={{ color: 'var(--muted)', fontSize: '0.82rem' }}>Байєс raw · 95 % CI: {fmt1(bayes.ci95Low)} – {fmt1(bayes.ci95High)}</span>
           </div>
           <Sparkline points={graphPoints} max={maxCpm} />
           <div style={{ display: 'flex', gap: '1.5rem', marginTop: '0.5rem', color: 'var(--muted)', fontSize: '0.8rem' }}>
-            <span>Поточне: <strong style={{ color: 'var(--accent)' }}>{fmt1(bayes.cpm)} CPM</strong></span>
+            <span>Поточне (Kalman): <strong style={{ color: 'var(--accent)' }}>{fmt1(kalmanCpm)} CPM</strong></span>
             <span>Фон регіону: {fmt2(settings.naturalBgMsvH)} μSv/год</span>
-            <span>Доза: {fmt2(doseRate)} μSv/год</span>
+            <span>Доза (median): {fmt2(doseRate)} μSv/год</span>
           </div>
         </div>
 
@@ -675,6 +818,11 @@ export default function App() {
               ['Gamma-Poisson Bayes', 'Пріор Gamma(2,12), апостеріор Gamma(α₀+n, β₀+t). 95% CI через Wilson-Hilferty. Звужується з ростом n.'],
               ['Arrhenius', 'Поріг ×exp(Ea/k · (1/T_ref − 1/T)). Ea=0.65 eV кремній. На +10 °C темновий струм × 2.'],
               ['Spatial validation', 'Клас: 1–6 пікселів, aspect < 4. γ: ≤3 px компактних. β: 4–6 px, aspect ≤ 3. Все інше — шум.'],
+              ['Kalman filter', '1D Калман згладжує CPM майже без затримки: prediction + correction із динамічними Q/R.'],
+              ['Adaptive EWMA', 'EWMA з адаптивним α: чим більша інновація, тим вище вага нового виміру.'],
+              ['Z-Score outlier reject', 'Аномальні сплески (|z| > 4) обрізаються перед Байєс-оновленням для стійкості до мюонів.'],
+              ['Rolling Dark Frame', 'Кожні 5 хв оновлюємо DCNU/PRNU через EMA, щоб компенсувати дрейф сенсора з часом.'],
+              ['Median dose filter', 'Останні 9 оцінок дози проходять через медіану для робастної накопиченої дози.'],
             ].map(([title, desc]) => (
               <div key={title} style={{ padding: '0.65rem', borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
                 <strong style={{ color: 'var(--accent)', display: 'block', marginBottom: 4, fontSize: '0.85rem' }}>{title}</strong>

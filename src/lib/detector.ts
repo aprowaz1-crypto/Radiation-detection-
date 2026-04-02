@@ -66,6 +66,44 @@ export function getBadPixelCount(): number {
   return badPixelSet.size
 }
 
+/**
+ * Rolling dark-frame update via EMA.
+ * Refreshes DCNU/PRNU maps using a new dark-like frame (typically every 5 min).
+ */
+export function updateCalibrationMapsEMA(
+  calibration: CalibrationMaps,
+  darkLikeFrame: Float32Array,
+  alpha: number
+): void {
+  if (!calibration || darkLikeFrame.length !== calibration.dcnu.length) return
+
+  const a = Math.max(0.001, Math.min(0.25, alpha))
+  const b = 1 - a
+  const n = calibration.dcnu.length
+  let globalSum = 0
+
+  for (let i = 0; i < n; i++) {
+    const prevDc = calibration.dcnu[i]
+    const nextDc = b * prevDc + a * darkLikeFrame[i]
+    calibration.dcnu[i] = nextDc
+    globalSum += nextDc
+
+    // Robust PRNU proxy update from normalized absolute deviation.
+    const dev = Math.abs(darkLikeFrame[i] - nextDc)
+    const ratio = nextDc > 1 ? dev / nextDc : calibration.prnu[i]
+    const clipped = Math.max(0.05, Math.min(4.0, ratio))
+    calibration.prnu[i] = b * calibration.prnu[i] + a * clipped
+  }
+
+  // Rebuild hot-pixel mask from updated dark map.
+  badPixelSet.clear()
+  const globalMean = globalSum / Math.max(1, n)
+  const hotThreshold = globalMean * 5
+  for (let i = 0; i < n; i++) {
+    if (calibration.dcnu[i] > hotThreshold) badPixelSet.add(i)
+  }
+}
+
 // ─── Calibration ──────────────────────────────────────────────────────────────
 
 /**
