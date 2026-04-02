@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Radiation Detection</string>
+    <string name="title_activity_main">Radiation Detection</string>
+    <string name="package_name">com.aprowaz1crypto.raddetection</string>
+    <string name="custom_url_scheme">com.aprowaz1crypto.raddetection</string>
+</resources>

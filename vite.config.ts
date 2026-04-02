@@ -5,9 +5,11 @@ import { VitePWA } from 'vite-plugin-pwa'
 export default defineConfig(({ mode }) => {
   const repoBase = '/Radiation-detection-/'
   const isProd = mode === 'production'
+  const isAndroid = mode === 'android'
+  const base = isAndroid ? './' : (isProd ? repoBase : '/')
 
   return {
-    base: isProd ? repoBase : '/',
+    base,
     plugins: [
       react(),
       VitePWA({
@@ -20,7 +22,7 @@ export default defineConfig(({ mode }) => {
           theme_color: '#101814',
           background_color: '#0b100d',
           display: 'standalone',
-          start_url: isProd ? repoBase : '/',
+          start_url: base,
           icons: [
             {
               src: 'icon.svg',
