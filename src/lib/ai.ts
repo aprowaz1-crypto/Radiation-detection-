@@ -1,157 +1,133 @@
-// @ts-ignore - tfjs types may be unavailable in minimal runtime; API usage is stable for this project
-import * as tf from '@tensorflow/tfjs'
+// ─── Gamma-Poisson Bayesian Inference for CPM / Dose estimation ──────────────
+//
+// Statistical model:
+//   Observed counts:  n events in t seconds  ~  Poisson(λ · t)
+//   Prior on rate λ:  Gamma(α₀, β₀)          (conjugate prior)
+//   Posterior:        Gamma(α₀ + n,  β₀ + t)
+//   Posterior mean:   (α₀ + n) / (β₀ + t)    [events / second]
+//
+// Prior hyperparameters encode a weak belief around natural background:
+//   α₀/β₀ ≈ 10 CPM = 10/60 events/s  with broad spread
+//   α₀ = 2,  β₀ = 12 s  →  prior mean = 10 CPM, but very diffuse.
+//
+// As observations accumulate the posterior narrows around the true rate
+// and the 95 % credible interval shrinks, matching the Poisson √n uncertainty.
 
-export type AiEventClass = 'noise' | 'gamma-quantum' | 'beta-particle' | 'alpha-star'
+const ALPHA0 = 2.0
+const BETA0 = 12.0     // seconds equivalent of prior observations
 
-const LABELS: AiEventClass[] = ['noise', 'gamma-quantum', 'beta-particle', 'alpha-star']
+// ─── Persistent accumulator ───────────────────────────────────────────────────
+let accumN = 0         // total observed events
+let accumT = 0         // total observation time [seconds]
 
-export type EventAiResult = {
-  label: AiEventClass
-  confidence: number
-  logits: number[]
+// ─── Public types ─────────────────────────────────────────────────────────────
+
+export type BayesEstimate = {
+  cpm: number            // Posterior mean [events per minute]
+  ci95Low: number        // 95 % credible interval lower bound [CPM]
+  ci95High: number       // 95 % credible interval upper bound [CPM]
+  uncertaintyPct: number // (hi − lo) / mean × 100 %
+  confidenceRatio: number// 0 … 1; grows as √n accumulates
 }
 
-export type DriftResult = {
-  adjustedBrightnessThreshold: number
-  adjustedDeltaThreshold: number
-  overheatingScore: number
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export function resetBayes(): void {
+  accumN = 0
+  accumT = 0
 }
 
-export class MiniAi {
-  private eventModel: tf.LayersModel
-
-  private driftModel: tf.LayersModel
-
-  constructor() {
-    this.eventModel = this.buildEventModel()
-    this.driftModel = this.buildDriftModel()
-  }
-
-  classifyEvent(window10x10: number[]): EventAiResult {
-    if (window10x10.length !== 100) {
-      return { label: 'noise', confidence: 1, logits: [1, 0, 0, 0] }
-    }
-
-    return tf.tidy(() => {
-      const tensor = tf.tensor4d(window10x10, [1, 10, 10, 1], 'float32')
-      const normalized = tf.div(tensor, 255)
-      const prediction = this.eventModel.predict(normalized) as tf.Tensor
-      const logits = Array.from(prediction.dataSync() as Float32Array)
-      const maxIndex = logits.reduce((bestIndex, value, index, source) => (value > source[bestIndex] ? index : bestIndex), 0)
-      return {
-        label: LABELS[maxIndex],
-        confidence: logits[maxIndex],
-        logits
-      }
-    })
-  }
-
-  analyzeDrift(
-    brightnessMean: number,
-    sigma: number,
-    hotPixelRatio: number,
-    currentBrightnessThreshold: number,
-    currentDeltaThreshold: number
-  ): DriftResult {
-    return tf.tidy(() => {
-      const features = tf.tensor2d(
-        [[brightnessMean / 255, sigma / 128, hotPixelRatio, currentBrightnessThreshold / 255, currentDeltaThreshold / 255]],
-        [1, 5],
-        'float32'
-      )
-      const output = this.driftModel.predict(features) as tf.Tensor
-      const [overheatingScore, brightnessShift, deltaShift] = Array.from(output.dataSync() as Float32Array)
-
-      const adjustedBrightnessThreshold = clamp(Math.round(currentBrightnessThreshold + brightnessShift * 24), 110, 255)
-      const adjustedDeltaThreshold = clamp(Math.round(currentDeltaThreshold + deltaShift * 18), 8, 255)
-
-      return {
-        adjustedBrightnessThreshold,
-        adjustedDeltaThreshold,
-        overheatingScore: clamp(overheatingScore, 0, 1)
-      }
-    })
-  }
-
-  private buildEventModel(): tf.LayersModel {
-    const input = tf.input({ shape: [10, 10, 1] })
-    const conv1 = tf.layers.conv2d({ filters: 8, kernelSize: 3, activation: 'relu', padding: 'same' }).apply(input) as tf.SymbolicTensor
-    const pool1 = tf.layers.maxPooling2d({ poolSize: 2 }).apply(conv1) as tf.SymbolicTensor
-    const conv2 = tf.layers.conv2d({ filters: 16, kernelSize: 3, activation: 'relu', padding: 'same' }).apply(pool1) as tf.SymbolicTensor
-    const flat = tf.layers.flatten().apply(conv2) as tf.SymbolicTensor
-    const dense = tf.layers.dense({ units: 32, activation: 'relu' }).apply(flat) as tf.SymbolicTensor
-    const output = tf.layers.dense({ units: 4, activation: 'softmax' }).apply(dense) as tf.SymbolicTensor
-
-    const model = tf.model({ inputs: input, outputs: output })
-
-    const kernel = tf.tensor4d(buildPatternKernels(), [3, 3, 1, 8], 'float32')
-    const bias = tf.zeros([8])
-    const convLayer = model.layers[1]
-    convLayer.setWeights([kernel, bias])
-
-    const denseLayer = model.layers[5]
-    const outputLayer = model.layers[6]
-    denseLayer.setWeights([
-      tf.randomUniform([400, 32], -0.08, 0.08, 'float32', 11),
-      tf.randomUniform([32], -0.02, 0.02, 'float32', 12)
-    ])
-    outputLayer.setWeights([
-      tf.randomUniform([32, 4], -0.1, 0.1, 'float32', 13),
-      tf.tensor1d([0.7, 0.2, 0.2, 0.15], 'float32')
-    ])
-
-    return model
-  }
-
-  private buildDriftModel(): tf.LayersModel {
-    const input = tf.input({ shape: [5] })
-    const dense1 = tf.layers.dense({ units: 8, activation: 'relu' }).apply(input) as tf.SymbolicTensor
-    const output = tf.layers.dense({ units: 3, activation: 'tanh' }).apply(dense1) as tf.SymbolicTensor
-    const model = tf.model({ inputs: input, outputs: output })
-
-    model.layers[1].setWeights([
-      tf.tensor2d([
-        [0.9, 0.2, -0.1, 0.7, 0.1, 0.4, -0.2, 0.3],
-        [0.6, 0.8, 0.1, 0.5, -0.4, 0.1, 0.2, -0.1],
-        [0.4, 0.7, 0.9, 0.6, 0.2, -0.2, 0.3, 0.1],
-        [0.1, 0.5, -0.2, 0.2, 0.3, 0.2, -0.3, 0.4],
-        [0.2, 0.4, 0.8, 0.2, 0.2, -0.1, 0.1, 0.1]
-      ], [5, 8], 'float32'),
-      tf.tensor1d([0, 0, 0, 0, 0, 0, 0, 0], 'float32')
-    ])
-
-    model.layers[2].setWeights([
-      tf.tensor2d([
-        [0.7, 0.6, 0.4],
-        [0.5, 0.5, 0.3],
-        [0.8, 0.6, 0.7],
-        [0.4, 0.3, 0.2],
-        [0.2, 0.3, 0.4],
-        [0.3, 0.2, 0.3],
-        [0.1, 0.3, 0.2],
-        [0.2, 0.2, 0.1]
-      ], [8, 3], 'float32'),
-      tf.tensor1d([0.05, 0.03, 0.02], 'float32')
-    ])
-
-    return model
-  }
+/**
+ * Add new observations to the Bayesian accumulator.
+ * @param events  Number of validated radiation events in this window
+ * @param seconds Length of the observation window in seconds
+ */
+export function addObservation(events: number, seconds: number): void {
+  accumN += events
+  accumT += seconds
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value))
+/**
+ * Compute the current Bayesian CPM estimate with 95 % credible interval.
+ * @param efficiencyCoeff  User-adjustable scale factor (default 1.0).
+ *                          Set to sensor/geometry calibration value once
+ *                          compared against a reference dosimeter.
+ */
+export function estimateCPM(efficiencyCoeff: number): BayesEstimate {
+  const alpha = ALPHA0 + accumN
+  const beta  = BETA0  + accumT   // β in "per second" units
+
+  // Posterior mean rate [events/s] → [events/min]
+  const rateSec = alpha / beta
+  const cpm = rateSec * 60 * efficiencyCoeff
+
+  // 95 % credible interval via Wilson-Hilferty gamma quantile approximation
+  const lo = gammaQuantile(0.025, alpha, beta) * 60 * efficiencyCoeff
+  const hi = gammaQuantile(0.975, alpha, beta) * 60 * efficiencyCoeff
+
+  // Relative uncertainty: narrows as √n
+  const uncertaintyPct = cpm > 0 ? Math.min(((hi - lo) / cpm) * 100, 999) : 100
+
+  // Confidence proxy: 0 at start, approaches 1 as n grows
+  const relErr = accumN > 0 ? 1 / Math.sqrt(accumN) : 1
+  const confidenceRatio = Math.max(0, Math.min(1, 1 - relErr))
+
+  return { cpm, ci95Low: lo, ci95High: hi, uncertaintyPct, confidenceRatio }
 }
 
-function buildPatternKernels(): number[] {
-  const kernels: number[][] = [
-    [0, 1, 0, 1, 4, 1, 0, 1, 0],
-    [1, 0, -1, 2, 0, -2, 1, 0, -1],
-    [1, 2, 1, 0, 0, 0, -1, -2, -1],
-    [0, 0, 1, 0, 1, 0, 1, 0, 0],
-    [1, 0, 1, 0, 1, 0, 1, 0, 1],
-    [0, -1, 0, -1, 5, -1, 0, -1, 0],
-    [0.5, 0, 0, 0, 1, 0, 0, 0, 0.5],
-    [0, 0.5, 0, 0.5, 1, 0.5, 0, 0.5, 0]
+/**
+ * Convert CPM to dose rate in μSv/h.
+ * @param cpm            Events per minute
+ * @param naturalBgMicroSvH  Regional natural background (μSv/h, e.g. 0.12)
+ * @param sensorFactor   μSv/h per CPM calibration coefficient for this device
+ */
+export function cpmToDose(
+  cpm: number,
+  naturalBgMicroSvH: number,
+  sensorFactor: number
+): number {
+  return naturalBgMicroSvH + Math.max(cpm, 0) * sensorFactor
+}
+
+// ─── Gamma distribution quantile (Wilson–Hilferty approximation) ─────────────
+//
+// For X ~ Gamma(α, rate = β), the p-th quantile is approximated via
+// the normal distribution and the WH cube-root transformation.
+
+function gammaQuantile(p: number, alpha: number, beta: number): number {
+  const scale = 1 / beta
+  const z = normalQuantile(p)
+  const a = alpha
+  const term = 1 - 1 / (9 * a) + z / Math.sqrt(9 * a)
+  const wh = a * Math.pow(Math.max(0, term), 3)
+  return wh * scale
+}
+
+// Beasley–Springer–Moro rational approximation for the normal quantile Φ⁻¹(p)
+function normalQuantile(p: number): number {
+  if (p <= 0) return -6
+  if (p >= 1) return 6
+
+  const a = [2.50662823884, -18.61500062529, 41.39119773534, -25.44106049637]
+  const b = [-8.47351093090, 23.08336743743, -21.06224101826, 3.13082909833]
+  const c = [
+    0.3374754822726, 0.9761690190917, 0.1607979714918,
+    0.0276438810334, 0.0038405729374, 0.0003951896511,
+    0.0000321767882, 0.0000002888167, 0.0000003960315,
   ]
-  return kernels.flat()
+
+  const x = p - 0.5
+  if (Math.abs(x) < 0.42) {
+    const r = x * x
+    return (
+      (x * (((a[3] * r + a[2]) * r + a[1]) * r + a[0])) /
+      ((((b[3] * r + b[2]) * r + b[1]) * r + b[0]) * r + 1)
+    )
+  }
+
+  const r = x < 0 ? p : 1 - p
+  const s = Math.log(-Math.log(r))
+  let t = c[0]
+  for (let i = 1; i < c.length; i++) t += c[i] * Math.pow(s, i)
+  return x < 0 ? -t : t
 }
