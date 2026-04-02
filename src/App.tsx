@@ -25,6 +25,7 @@ const GRAPH_LEN    = 60          // seconds of history in graph
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type AppStatus = 'idle' | 'calibrating' | 'measuring' | 'error'
+type CameraPermission = 'unknown' | 'prompt' | 'granted' | 'denied' | 'unsupported'
 
 type Settings = {
   efficiencyCoeff: number   // user scale factor (default 1.0)
@@ -42,6 +43,27 @@ const DEFAULT_SETTINGS: Settings = {
 function fmt1(n: number) { return n.toFixed(1) }
 function fmt2(n: number) { return n.toFixed(2) }
 function fmtPct(n: number) { return Math.round(n) + ' %' }
+
+function describeCameraError(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return 'Не вдалося отримати доступ до камери.'
+  }
+
+  if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+    return 'Доступ до камери заборонено. Дозвольте камеру в налаштуваннях браузера/додатка і спробуйте ще раз.'
+  }
+  if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+    return 'Камеру не знайдено на цьому пристрої.'
+  }
+  if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+    return 'Камера зайнята іншим застосунком. Закрийте інші програми з доступом до камери.'
+  }
+  if (err.name === 'OverconstrainedError') {
+    return 'Поточні параметри камери не підтримуються пристроєм. Спробуйте ще раз.'
+  }
+
+  return err.message || 'Не вдалося отримати доступ до камери.'
+}
 
 function StatusDot({ status }: { status: AppStatus }) {
   const colors: Record<AppStatus, string> = {
@@ -111,6 +133,7 @@ export default function App() {
   // UI state
   const [status,       setStatus]       = useState<AppStatus>('idle')
   const [statusMsg,    setStatusMsg]    = useState('Оберіть камеру і натисніть «Старт». Перед запуском повністю заклейте об\'єктив.')
+  const [cameraPerm,   setCameraPerm]   = useState<CameraPermission>('unknown')
   const [calibProgress,setCalibProgress]= useState(0)
   const [bayes,        setBayes]        = useState<BayesEstimate>({ cpm: 0, ci95Low: 0, ci95High: 0, uncertaintyPct: 100, confidenceRatio: 0 })
   const [doseRate,     setDoseRate]     = useState(0)
@@ -146,6 +169,38 @@ export default function App() {
         battery.addEventListener('chargingchange', updateTemp)
         battery.addEventListener('levelchange', updateTemp)
       }).catch(() => {})
+    }
+  }, [])
+
+  // Check camera permission state when browser supports Permissions API
+  useEffect(() => {
+    let permStatus: PermissionStatus | null = null
+
+    const updatePermission = () => {
+      if (!permStatus) return
+      const state = permStatus.state
+      if (state === 'granted' || state === 'prompt' || state === 'denied') {
+        setCameraPerm(state)
+      }
+    }
+
+    const run = async () => {
+      if (!('permissions' in navigator) || !navigator.permissions?.query) {
+        setCameraPerm('unsupported')
+        return
+      }
+      try {
+        permStatus = await navigator.permissions.query({ name: 'camera' as PermissionName })
+        updatePermission()
+        permStatus.onchange = updatePermission
+      } catch {
+        setCameraPerm('unsupported')
+      }
+    }
+
+    run()
+    return () => {
+      if (permStatus) permStatus.onchange = null
     }
   }, [])
 
@@ -248,6 +303,37 @@ export default function App() {
   }, [status, runLoop])
 
   // ─── Start / Stop ──────────────────────────────────────────────────────────
+  const requestCameraPermission = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus('error')
+      setStatusMsg('Цей браузер не підтримує доступ до камери (MediaDevices API).')
+      return false
+    }
+
+    if (!window.isSecureContext) {
+      setStatus('error')
+      setStatusMsg('Доступ до камери працює лише в захищеному контексті (HTTPS або localhost).')
+      return false
+    }
+
+    setStatusMsg('Підтвердіть запит на доступ до камери...')
+    try {
+      const probe = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false,
+      })
+      probe.getTracks().forEach(track => track.stop())
+      setCameraPerm('granted')
+      setStatusMsg('Доступ до камери надано. Натисніть «Старт» для калібрування.')
+      return true
+    } catch (err) {
+      setCameraPerm('denied')
+      setStatus('error')
+      setStatusMsg(describeCameraError(err))
+      return false
+    }
+  }, [])
+
   const handleStart = async () => {
     handleStop()
     resetDetectorState()
@@ -263,6 +349,9 @@ export default function App() {
     setAccumDose(0)
     setCalibProgress(0)
     setElapsedSec(0)
+
+    const hasPermission = cameraPerm === 'granted' || await requestCameraPermission()
+    if (!hasPermission) return
 
     setStatus('calibrating')
     setStatusMsg('Калібрування… Зніміть 40 темних кадрів (DCNU/PRNU). Не знімайте ізоленту.')
@@ -292,7 +381,7 @@ export default function App() {
       await video.play()
     } catch (err) {
       setStatus('error')
-      setStatusMsg(err instanceof Error ? err.message : 'Не вдалося отримати доступ до камери.')
+      setStatusMsg(describeCameraError(err))
     }
   }
 
@@ -406,6 +495,9 @@ export default function App() {
 
         {/* Controls */}
         <div className="button-row" style={{ marginTop: 2 }}>
+          {!isRunning && cameraPerm !== 'granted' && (
+            <button className="ghost" onClick={requestCameraPermission}>Надати доступ до камери</button>
+          )}
           {!isRunning
             ? <button onClick={handleStart}>▶ Старт</button>
             : <button onClick={handleStop} style={{ background: 'rgba(255,137,106,0.25)', color: '#ff896a', border: '1px solid rgba(255,137,106,0.35)' }}>■ Стоп</button>
